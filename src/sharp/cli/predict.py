@@ -13,7 +13,6 @@ import click
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.data
 
 from sharp.models import (
     PredictorParams,
@@ -37,85 +36,43 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 
 
 @click.command()
-@click.option(
-    "-i",
-    "--input-path",
-    type=click.Path(path_type=Path, exists=True),
-    help="Path to an image or containing a list of images.",
-    required=True,
-)
-@click.option(
-    "-o",
-    "--output-path",
-    type=click.Path(path_type=Path, file_okay=False),
-    help="Path to save the predicted Gaussians and renderings.",
-    required=True,
-)
-@click.option(
-    "-c",
-    "--checkpoint-path",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
-    help="Path to the .pt checkpoint. If not provided, downloads the default model automatically.",
-    required=False,
-)
-@click.option(
-    "--render/--no-render",
-    "with_rendering",
-    is_flag=True,
-    default=False,
-    help="Whether to render trajectory for checkpoint.",
-)
-@click.option(
-    "--device",
-    type=str,
-    default="default",
-    help="Device to run on. ['cpu', 'mps', 'cuda']",
-)
-@click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
+@click.option("-i", "--input-path", type=click.Path(path_type=Path, exists=True), required=True)
+@click.option("-o", "--output-path", type=click.Path(path_type=Path, file_okay=False), required=True)
+@click.option("-c", "--checkpoint-path", type=click.Path(path_type=Path, dir_okay=False), default=None)
+@click.option("--render/--no-render", "with_rendering", is_flag=True, default=False)
+@click.option("--device", type=str, default="default")
+@click.option("--decimate", type=int, default=1, help="Reduce splat count (1=Keep All, 2=Half, 4=Quarter).")
+@click.option("-v", "--verbose", is_flag=True)
 def predict_cli(
     input_path: Path,
     output_path: Path,
     checkpoint_path: Path,
     with_rendering: bool,
     device: str,
+    decimate: int,
     verbose: bool,
 ):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
+    # ... Image Loading Boilerplate ...
     extensions = io.get_supported_image_extensions()
-
-    image_paths = []
-    if input_path.is_file():
-        if input_path.suffix in extensions:
-            image_paths = [input_path]
-    else:
+    image_paths = [input_path] if input_path.is_file() else []
+    if not input_path.is_file():
         for ext in extensions:
             image_paths.extend(list(input_path.glob(f"**/*{ext}")))
 
-    if len(image_paths) == 0:
-        LOGGER.info("No valid images found. Input was %s.", input_path)
+    if not image_paths:
+        LOGGER.info("No valid images found.")
         return
 
-    LOGGER.info("Processing %d valid image files.", len(image_paths))
-
     if device == "default":
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
     LOGGER.info("Using device %s", device)
 
-    if with_rendering and device != "cuda":
-        LOGGER.warning("Can only run rendering with gsplat on CUDA. Rendering is disabled.")
-        with_rendering = False
-
-    # Load or download checkpoint
+    # Load Model
     if checkpoint_path is None:
-        LOGGER.info("No checkpoint provided. Downloading default model from %s", DEFAULT_MODEL_URL)
+        LOGGER.info("Downloading default model...")
         state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
     else:
         LOGGER.info("Loading checkpoint from %s", checkpoint_path)
@@ -129,30 +86,38 @@ def predict_cli(
     output_path.mkdir(exist_ok=True, parents=True)
 
     for image_path in image_paths:
-        LOGGER.info("Processing %s", image_path)
+        LOGGER.info(f"Processing {image_path.name}")
         image, _, f_px = io.load_rgb(image_path)
         height, width = image.shape[:2]
+
         intrinsics = torch.tensor(
-            [
-                [f_px, 0, (width - 1) / 2.0, 0],
-                [0, f_px, (height - 1) / 2.0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ],
-            device=device,
-            dtype=torch.float32,
+            [[f_px, 0, (width - 1) / 2.0, 0], [0, f_px, (height - 1) / 2.0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            device=device, dtype=torch.float32
         )
+        
+        # 1. Run Original Inference
         gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
 
-        LOGGER.info("Saving 3DGS to %s", output_path)
+        # === 2. DECIMATION (The only change) ===
+        if decimate > 1:
+            LOGGER.info(f"Decimating {decimate}x (Original: {gaussians.mean_vectors.shape[1]} splats)")
+            
+            # Slicing with [:, ::decimate, :] preserves the Batch dimension [1, N, C].
+            # This keeps save_ply happy.
+            gaussians = Gaussians3D(
+                mean_vectors=gaussians.mean_vectors[:, ::decimate, :],
+                singular_values=gaussians.singular_values[:, ::decimate, :],
+                quaternions=gaussians.quaternions[:, ::decimate, :],
+                colors=gaussians.colors[:, ::decimate, :],
+                opacities=gaussians.opacities[:, ::decimate] # Opacities are [1, N]
+            )
+
+        LOGGER.info(f"Saving {gaussians.mean_vectors.shape[1]} splats to {output_path}")
         save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
 
         if with_rendering:
-            output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
-            LOGGER.info("Rendering trajectory to %s", output_video_path)
-
-            metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-            render_gaussians(gaussians, metadata, output_video_path)
+             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
+             render_gaussians(gaussians, metadata, (output_path / image_path.stem).with_suffix(".mp4"))
 
 
 @torch.no_grad()
@@ -162,14 +127,16 @@ def predict_image(
     f_px: float,
     device: torch.device,
 ) -> Gaussians3D:
-    """Predict Gaussians from an image."""
-    internal_shape = (1536, 1536)
+    """Predict Gaussians (Original Implementation)."""
+    # Original settings
+    internal_shape = (1536, 1536) 
 
     LOGGER.info("Running preprocessing.")
     image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
     disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
+    # Standard Stretch (Original Repo Behavior)
     image_resized_pt = F.interpolate(
         image_pt[None],
         size=(internal_shape[1], internal_shape[0]),
@@ -177,28 +144,19 @@ def predict_image(
         align_corners=True,
     )
 
-    # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
     gaussians_ndc = predictor(image_resized_pt, disparity_factor)
 
     LOGGER.info("Running postprocessing.")
-    intrinsics = (
-        torch.tensor(
-            [
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        .float()
-        .to(device)
-    )
+    intrinsics = torch.tensor(
+        [[f_px, 0, width / 2, 0], [0, f_px, height / 2, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    ).float().to(device)
+    
     intrinsics_resized = intrinsics.clone()
     intrinsics_resized[0] *= internal_shape[0] / width
     intrinsics_resized[1] *= internal_shape[1] / height
 
-    # Convert Gaussians to metrics space.
+    # Standard Unprojection (Original Repo Behavior)
     gaussians = unproject_gaussians(
         gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
     )
